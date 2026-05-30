@@ -1,6 +1,5 @@
 from fastapi import FastAPI, HTTPException, Depends
 from sqlalchemy.orm import Session
-from typing import List
 
 from models import Todo, TodoCreate, TodoUpdate
 from database import engine, get_db
@@ -22,7 +21,7 @@ def create_todo(todo: TodoCreate, db: Session = Depends(get_db)):
 
 
 # ─── READ ALL ─────────────────────────────────────────
-@app.get("/todos", response_model=List[Todo])
+@app.get("/todos", response_model=list[Todo])
 def get_all_todos(db: Session = Depends(get_db)):
     return db.query(db_models.TodoModel).all()
 
