@@ -8,12 +8,18 @@ A simple REST API for managing todos, built with **FastAPI**, **SQLAlchemy**, an
 
 ```
 MyFirstProject/
-├── main.py        # API routes and app entry point
-├── models.py      # Pydantic schemas (request/response shapes)
-├── db_models.py   # SQLAlchemy ORM model (database table)
-├── database.py    # DB connection, session, and Base
-├── .env           # Environment variables (DATABASE_URL)
-├── pyproject.toml # Poetry dependencies
+├── main.py            # App entry point — registers routers, creates tables
+├── database.py        # DB engine, session factory, and Base
+├── .env               # Environment variables (DATABASE_URL)
+├── pyproject.toml     # Poetry dependencies
+├── routers/
+│   └── todos.py       # HTTP routes for /todos endpoints
+├── schemas/
+│   └── todo.py        # Pydantic models (request/response shapes)
+├── models/
+│   └── todo.py        # SQLAlchemy ORM model (database table)
+└── crud/
+    └── todo.py        # Database operations (create, read, update, delete)
 ```
 
 ---
@@ -62,7 +68,7 @@ def get_db():
 
 ---
 
-### 3. `db_models.py` — Database Table
+### 3. `models/todo.py` — Database Table
 
 ```python
 from sqlalchemy import Column, Integer, String, Boolean
@@ -82,11 +88,24 @@ This is the **SQLAlchemy model** — it defines the actual `todos` table in Post
 
 ---
 
-### 4. `models.py` — Pydantic Schemas
+### 4. `schemas/todo.py` — Pydantic Schemas
 
 ```python
 from pydantic import BaseModel
 from typing import Optional
+
+
+class TodoCreate(BaseModel):
+    title: str
+    description: str
+    completed: bool = False
+
+
+class TodoUpdate(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    completed: Optional[bool] = None
+
 
 class Todo(BaseModel):
     id: int
@@ -94,106 +113,146 @@ class Todo(BaseModel):
     description: str
     completed: bool = False
 
-class TodoCreate(BaseModel):
-    title: str
-    description: str
-    completed: bool = False
-
-class TodoUpdate(BaseModel):
-    title: Optional[str] = None
-    description: Optional[str] = None
-    completed: Optional[bool] = None
+    class Config:
+        from_attributes = True
 ```
 
-These are **Pydantic models** — they validate and shape the data coming in and going out of the API:
+These are **Pydantic schemas** — they validate and shape the data coming in and going out of the API:
 
 | Schema | Purpose |
 |---|---|
-| `Todo` | Full response shape (includes `id`) |
 | `TodoCreate` | Request body for creating a todo (no `id` — DB generates it) |
 | `TodoUpdate` | Request body for partial updates (all fields optional) |
+| `Todo` | Full response shape (includes `id`) |
 
-> Pydantic models ≠ database models. Pydantic handles HTTP layer; SQLAlchemy handles the database layer.
+> `from_attributes = True` allows Pydantic to read data directly from SQLAlchemy ORM objects.
+
+> Pydantic schemas ≠ database models. Pydantic handles the HTTP layer; SQLAlchemy handles the database layer.
 
 ---
 
-### 5. `main.py` — API Routes
+### 5. `crud/todo.py` — Database Operations
 
 ```python
-from fastapi import FastAPI, HTTPException, Depends
 from sqlalchemy.orm import Session
-from typing import List
+from models.todo import TodoModel
+from schemas.todo import TodoCreate, TodoUpdate
 
-from models import Todo, TodoCreate, TodoUpdate
-from database import engine, get_db
-import db_models
 
-db_models.Base.metadata.create_all(bind=engine)
+def get_all(db: Session) -> list[TodoModel]:
+    return db.query(TodoModel).all()
 
-app = FastAPI(title="Todo API", version="1.0.0")
-```
 
-`Base.metadata.create_all(bind=engine)` runs on startup — it creates the `todos` table if it doesn't already exist.
+def get_one(db: Session, todo_id: int) -> TodoModel | None:
+    return db.query(TodoModel).filter(TodoModel.id == todo_id).first()
 
-#### CREATE — `POST /todos`
-```python
-@app.post("/todos", response_model=Todo, status_code=201)
-def create_todo(todo: TodoCreate, db: Session = Depends(get_db)):
-    new_todo = db_models.TodoModel(**todo.model_dump())
+
+def create(db: Session, todo: TodoCreate) -> TodoModel:
+    new_todo = TodoModel(**todo.model_dump())
     db.add(new_todo)
     db.commit()
     db.refresh(new_todo)
     return new_todo
-```
-- Accepts a `TodoCreate` body, converts it to a `TodoModel`, saves to DB
-- `db.refresh()` re-reads the row so the DB-generated `id` is returned in the response
 
-#### READ ALL — `GET /todos`
-```python
-@app.get("/todos", response_model=List[Todo])
-def get_all_todos(db: Session = Depends(get_db)):
-    return db.query(db_models.TodoModel).all()
-```
-- Queries all rows from the `todos` table
 
-#### READ ONE — `GET /todos/{todo_id}`
-```python
-@app.get("/todos/{todo_id}", response_model=Todo)
-def get_todo(todo_id: int, db: Session = Depends(get_db)):
-    todo = db.query(db_models.TodoModel).filter(db_models.TodoModel.id == todo_id).first()
+def update(db: Session, todo_id: int, updated: TodoUpdate) -> TodoModel | None:
+    todo = get_one(db, todo_id)
     if not todo:
-        raise HTTPException(status_code=404, detail="Todo not found")
-    return todo
-```
-- Filters by `id`, returns 404 if not found
-
-#### UPDATE — `PUT /todos/{todo_id}`
-```python
-@app.put("/todos/{todo_id}", response_model=Todo)
-def update_todo(todo_id: int, updated: TodoUpdate, db: Session = Depends(get_db)):
-    todo = db.query(db_models.TodoModel).filter(db_models.TodoModel.id == todo_id).first()
-    if not todo:
-        raise HTTPException(status_code=404, detail="Todo not found")
+        return None
     for field, value in updated.model_dump(exclude_none=True).items():
         setattr(todo, field, value)
     db.commit()
     db.refresh(todo)
     return todo
-```
-- `exclude_none=True` means only fields the client actually sent get updated (partial update)
-- `setattr` dynamically sets each changed field on the ORM object
 
-#### DELETE — `DELETE /todos/{todo_id}`
-```python
-@app.delete("/todos/{todo_id}", status_code=204)
-def delete_todo(todo_id: int, db: Session = Depends(get_db)):
-    todo = db.query(db_models.TodoModel).filter(db_models.TodoModel.id == todo_id).first()
+
+def delete(db: Session, todo_id: int) -> bool:
+    todo = get_one(db, todo_id)
     if not todo:
-        raise HTTPException(status_code=404, detail="Todo not found")
+        return False
     db.delete(todo)
     db.commit()
+    return True
 ```
-- Deletes the row and returns `204 No Content` (no response body)
+
+This layer contains all database logic, keeping routes clean:
+
+- **`get_all`** — fetches every row from `todos`
+- **`get_one`** — fetches a single row by `id`, returns `None` if not found
+- **`create`** — inserts a new row, refreshes to get the DB-generated `id`
+- **`update`** — applies only the fields that were sent (`exclude_none=True`)
+- **`delete`** — removes the row, returns `False` if it didn't exist
+
+---
+
+### 6. `routers/todos.py` — HTTP Routes
+
+```python
+from fastapi import APIRouter, HTTPException, Depends
+from sqlalchemy.orm import Session
+from database import get_db
+from schemas.todo import Todo, TodoCreate, TodoUpdate
+import crud.todo as crud
+
+router = APIRouter(prefix="/todos", tags=["todos"])
+
+
+@router.post("", response_model=Todo, status_code=201)
+def create_todo(todo: TodoCreate, db: Session = Depends(get_db)):
+    return crud.create(db, todo)
+
+
+@router.get("", response_model=list[Todo])
+def get_all_todos(db: Session = Depends(get_db)):
+    return crud.get_all(db)
+
+
+@router.get("/{todo_id}", response_model=Todo)
+def get_todo(todo_id: int, db: Session = Depends(get_db)):
+    todo = crud.get_one(db, todo_id)
+    if not todo:
+        raise HTTPException(status_code=404, detail="Todo not found")
+    return todo
+
+
+@router.put("/{todo_id}", response_model=Todo)
+def update_todo(todo_id: int, updated: TodoUpdate, db: Session = Depends(get_db)):
+    todo = crud.update(db, todo_id, updated)
+    if not todo:
+        raise HTTPException(status_code=404, detail="Todo not found")
+    return todo
+
+
+@router.delete("/{todo_id}", status_code=204)
+def delete_todo(todo_id: int, db: Session = Depends(get_db)):
+    if not crud.delete(db, todo_id):
+        raise HTTPException(status_code=404, detail="Todo not found")
+```
+
+Routes are responsible only for HTTP concerns — accepting requests, calling the right crud function, and returning HTTP errors when something isn't found. No DB logic lives here.
+
+- **`APIRouter`** with `prefix="/todos"` means all routes automatically start with `/todos`
+- **`Depends(get_db)`** injects a DB session into each route automatically
+
+---
+
+### 7. `main.py` — App Entry Point
+
+```python
+from fastapi import FastAPI
+from database import engine
+from models.todo import TodoModel
+from routers import todos
+
+TodoModel.metadata.create_all(bind=engine)
+
+app = FastAPI(title="Todo API", version="1.0.0")
+
+app.include_router(todos.router)
+```
+
+- `metadata.create_all(bind=engine)` — creates the `todos` table on startup if it doesn't exist
+- `app.include_router(todos.router)` — registers all routes from `routers/todos.py`
 
 ---
 
