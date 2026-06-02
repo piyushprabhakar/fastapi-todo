@@ -1,0 +1,28 @@
+# Python
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.egg-info
+
+# Environment
+.env
+
+# Version control
+.git
+.gitignore
+
+# IDE
+.idea
+.vscode
+
+# Documentation
+*.md
+
+# Docker
+Dockerfile
+docker-compose.yml
+
+# OS
+.DS_Store

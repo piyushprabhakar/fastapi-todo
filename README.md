@@ -1,25 +1,37 @@
-# Todo API — FastAPI + PostgreSQL
+# Todo API — FastAPI + PostgreSQL + JWT Auth
 
-A simple REST API for managing todos, built with **FastAPI**, **SQLAlchemy**, and **PostgreSQL**.
+A REST API for managing todos with JWT-based authentication, middleware, and centralized error handling, built with **FastAPI**, **SQLAlchemy**, and **PostgreSQL**.
 
 ---
 
 ## Project Structure
 
 ```
-MyFirstProject/
-├── main.py            # App entry point — registers routers, creates tables
-├── database.py        # DB engine, session factory, and Base
-├── .env               # Environment variables (DATABASE_URL)
-├── pyproject.toml     # Poetry dependencies
+fastapi-todo/
+├── main.py                    # App entry point — registers routers, middleware, exception handlers
+├── database.py                # DB engine, session factory, and Base
+├── .env                       # Environment variables
+├── pyproject.toml             # Poetry dependencies
+├── Dockerfile                 # Container image definition
+├── docker-compose.yml         # Orchestrates API + PostgreSQL containers
+├── .dockerignore              # Files excluded from the Docker build context
+├── core/
+│   ├── config.py              # Loads JWT settings from .env
+│   ├── security.py            # Password hashing, JWT creation, get_current_user
+│   ├── middleware.py          # Request logging middleware
+│   └── exceptions.py         # Custom exception classes and global exception handlers
 ├── routers/
-│   └── todos.py       # HTTP routes for /todos endpoints
+│   ├── auth.py                # POST /auth/register, POST /auth/login
+│   └── todos.py               # Protected /todos endpoints
 ├── schemas/
-│   └── todo.py        # Pydantic models (request/response shapes)
+│   ├── user.py                # Pydantic schemas for auth (UserCreate, Token, etc.)
+│   └── todo.py                # Pydantic schemas for todos
 ├── models/
-│   └── todo.py        # SQLAlchemy ORM model (database table)
+│   ├── user.py                # SQLAlchemy users table
+│   └── todo.py                # SQLAlchemy todos table
 └── crud/
-    └── todo.py        # Database operations (create, read, update, delete)
+    ├── user.py                # get_by_email(), create_user()
+    └── todo.py                # Todo DB operations
 ```
 
 ---
@@ -30,9 +42,15 @@ MyFirstProject/
 
 ```env
 DATABASE_URL=postgresql://postgres:postgres@localhost:5432/postgres
+SECRET_KEY=change-this-to-a-long-random-secret-key-in-production
+ALGORITHM=HS256
+ACCESS_TOKEN_EXPIRE_MINUTES=30
 ```
 
-Stores the database connection string. Loaded at runtime using `python-dotenv` so credentials are never hardcoded.
+- **`DATABASE_URL`** — PostgreSQL connection string
+- **`SECRET_KEY`** — used to sign and verify JWTs. Must be kept private.
+- **`ALGORITHM`** — `HS256` (HMAC with SHA-256), the standard JWT signing algorithm
+- **`ACCESS_TOKEN_EXPIRE_MINUTES`** — how long a token stays valid before the user must log in again
 
 ---
 
@@ -63,12 +81,232 @@ def get_db():
 
 - **`engine`** — establishes the connection to PostgreSQL
 - **`SessionLocal`** — factory that creates a new DB session per request
-- **`Base`** — all ORM models inherit from this; SQLAlchemy uses it to know which classes map to tables
-- **`get_db()`** — a FastAPI dependency that opens a session before a request and closes it after, even if an error occurs
+- **`Base`** — all ORM models inherit from this
+- **`get_db()`** — FastAPI dependency that opens a session before a request and closes it after
 
 ---
 
-### 3. `models/todo.py` — Database Table
+### 3. `core/config.py` — JWT Settings
+
+```python
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
+SECRET_KEY = os.getenv("SECRET_KEY")
+ALGORITHM = os.getenv("ALGORITHM", "HS256")
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 30))
+```
+
+Loads JWT settings from `.env` into module-level constants used by `security.py`.
+
+---
+
+### 4. `core/security.py` — Auth Logic
+
+```python
+from datetime import datetime, timedelta, timezone
+from jose import jwt, JWTError
+import bcrypt
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+from sqlalchemy.orm import Session
+from database import get_db
+from core.config import SECRET_KEY, ALGORITHM, ACCESS_TOKEN_EXPIRE_MINUTES
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+
+
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+
+
+def verify_password(plain: str, hashed: str) -> bool:
+    return bcrypt.checkpw(plain.encode(), hashed.encode())
+
+
+def create_access_token(user_id: int) -> str:
+    payload = {
+        "sub": str(user_id),
+        "exp": datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
+    }
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    from models.user import UserModel
+
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid or expired token",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: str = payload.get("sub")
+        if user_id is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+
+    user = db.query(UserModel).filter(UserModel.id == int(user_id)).first()
+    if not user:
+        raise credentials_exception
+    return user
+```
+
+- **`hash_password`** — one-way bcrypt hash; never store plain passwords
+- **`verify_password`** — compares plain input against stored hash on login
+- **`create_access_token`** — builds a JWT with the user's `id` as `sub` and an expiry time
+- **`oauth2_scheme`** — tells FastAPI to read `Authorization: Bearer <token>` from request headers
+- **`get_current_user`** — decodes the token, validates it, fetches the user; raises `401` on any failure
+
+> **Why not `passlib`?** `passlib` is unmaintained and incompatible with `bcrypt` 4+ — it crashes with `AttributeError: module 'bcrypt' has no attribute '__about__'`. Using `bcrypt` directly avoids this entirely.
+
+---
+
+### 5. `core/middleware.py` — Request Logging
+
+```python
+import time
+from fastapi import Request
+
+
+async def logging_middleware(request: Request, call_next):
+    start = time.time()
+    response = await call_next(request)
+    duration = round((time.time() - start) * 1000, 2)
+    print(f"{request.method} {request.url.path} → {response.status_code} ({duration}ms)")
+    return response
+```
+
+Wraps every request. Logs the HTTP method, path, response status code, and duration in milliseconds to stdout on every request:
+
+```
+POST /auth/login → 200 (43.2ms)
+GET /todos → 200 (12.1ms)
+GET /todos/999 → 404 (8.7ms)
+```
+
+- Everything **before** `call_next` runs on the way in
+- Everything **after** `call_next` runs on the way out with access to the response
+
+---
+
+### 6. `core/exceptions.py` — Custom Exceptions & Global Handlers
+
+```python
+import sys
+from fastapi import Request
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+
+
+class NotFoundException(Exception):
+    def __init__(self, resource: str, id: int):
+        self.resource = resource
+        self.id = id
+
+
+class AlreadyExistsException(Exception):
+    def __init__(self, detail: str):
+        self.detail = detail
+
+
+async def not_found_handler(request: Request, exc: NotFoundException) -> JSONResponse:
+    return JSONResponse(
+        status_code=404,
+        content={"detail": f"{exc.resource} with id {exc.id} not found"},
+    )
+
+
+async def already_exists_handler(request: Request, exc: AlreadyExistsException) -> JSONResponse:
+    return JSONResponse(
+        status_code=400,
+        content={"detail": exc.detail},
+    )
+
+
+async def validation_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    errors = [
+        {"field": e["loc"][-1], "message": e["msg"]}
+        for e in exc.errors()
+    ]
+    return JSONResponse(status_code=422, content={"detail": errors})
+
+
+async def global_handler(request: Request, exc: Exception) -> JSONResponse:
+    print(f"Unhandled error: {type(exc).__name__}: {exc}", file=sys.stderr)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "An unexpected error occurred"},
+    )
+```
+
+**Custom exception classes:**
+
+| Class | Raised when | HTTP Status |
+|---|---|---|
+| `NotFoundException` | A todo ID doesn't exist in the DB | 404 |
+| `AlreadyExistsException` | Registering with a duplicate email | 400 |
+
+**Global exception handlers** — registered in `main.py`, catch specific exception types across the entire app:
+
+| Handler | Catches | Response |
+|---|---|---|
+| `not_found_handler` | `NotFoundException` | `{"detail": "Todo with id 5 not found"}` |
+| `already_exists_handler` | `AlreadyExistsException` | `{"detail": "Email already registered"}` |
+| `validation_handler` | `RequestValidationError` (422) | Clean field-level errors list |
+| `global_handler` | Any unhandled `Exception` | Safe 500 message; logs real error to stderr |
+
+**Before (inline HTTPException):**
+```python
+raise HTTPException(status_code=404, detail="Todo not found")
+```
+
+**After (semantic custom exception):**
+```python
+raise NotFoundException(resource="Todo", id=todo_id)
+# → {"detail": "Todo with id 5 not found"}
+```
+
+**Validation error — before (verbose default):**
+```json
+{
+  "detail": [{"type": "missing", "loc": ["body", "title"], "msg": "Field required", ...}]
+}
+```
+
+**Validation error — after (clean):**
+```json
+{
+  "detail": [{"field": "title", "message": "Field required"}]
+}
+```
+
+---
+
+### 7. `models/user.py` — Users Table
+
+```python
+from sqlalchemy import Column, Integer, String
+from database import Base
+
+
+class UserModel(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String, unique=True, nullable=False, index=True)
+    hashed_password = Column(String, nullable=False)
+```
+
+The `users` table stores only `email` and `hashed_password` — never the plain password.
+
+---
+
+### 8. `models/todo.py` — Todos Table
 
 ```python
 from sqlalchemy import Column, Integer, String, Boolean
@@ -84,11 +322,46 @@ class TodoModel(Base):
     completed = Column(Boolean, default=False)
 ```
 
-This is the **SQLAlchemy model** — it defines the actual `todos` table in PostgreSQL. Each `Column` maps to a column in the table. SQLAlchemy auto-generates the `id` (primary key) on insert.
+---
+
+### 9. `schemas/user.py` — Auth Pydantic Schemas
+
+```python
+from pydantic import BaseModel, EmailStr
+
+
+class UserCreate(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class UserResponse(BaseModel):
+    id: int
+    email: str
+
+    class Config:
+        from_attributes = True
+
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+
+class TokenData(BaseModel):
+    user_id: int | None = None
+```
+
+| Schema | Used for |
+|---|---|
+| `UserCreate` | Request body for `/auth/register` and `/auth/login` |
+| `UserResponse` | Response after register (no password returned) |
+| `Token` | Response after login — contains the JWT |
+| `TokenData` | Internal helper to hold decoded token payload |
 
 ---
 
-### 4. `schemas/todo.py` — Pydantic Schemas
+### 10. `schemas/todo.py` — Todo Pydantic Schemas
 
 ```python
 from pydantic import BaseModel
@@ -117,21 +390,35 @@ class Todo(BaseModel):
         from_attributes = True
 ```
 
-These are **Pydantic schemas** — they validate and shape the data coming in and going out of the API:
+---
 
-| Schema | Purpose |
-|---|---|
-| `TodoCreate` | Request body for creating a todo (no `id` — DB generates it) |
-| `TodoUpdate` | Request body for partial updates (all fields optional) |
-| `Todo` | Full response shape (includes `id`) |
+### 11. `crud/user.py` — User DB Operations
 
-> `from_attributes = True` allows Pydantic to read data directly from SQLAlchemy ORM objects.
+```python
+from sqlalchemy.orm import Session
+from models.user import UserModel
+from schemas.user import UserCreate
+from core.security import hash_password
 
-> Pydantic schemas ≠ database models. Pydantic handles the HTTP layer; SQLAlchemy handles the database layer.
+
+def get_by_email(db: Session, email: str) -> UserModel | None:
+    return db.query(UserModel).filter(UserModel.email == email).first()
+
+
+def create_user(db: Session, user: UserCreate) -> UserModel:
+    new_user = UserModel(
+        email=user.email,
+        hashed_password=hash_password(user.password),
+    )
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    return new_user
+```
 
 ---
 
-### 5. `crud/todo.py` — Database Operations
+### 12. `crud/todo.py` — Todo DB Operations
 
 ```python
 from sqlalchemy.orm import Session
@@ -142,10 +429,8 @@ from schemas.todo import TodoCreate, TodoUpdate
 def get_all(db: Session) -> list[TodoModel]:
     return db.query(TodoModel).all()
 
-
 def get_one(db: Session, todo_id: int) -> TodoModel | None:
     return db.query(TodoModel).filter(TodoModel.id == todo_id).first()
-
 
 def create(db: Session, todo: TodoCreate) -> TodoModel:
     new_todo = TodoModel(**todo.model_dump())
@@ -153,7 +438,6 @@ def create(db: Session, todo: TodoCreate) -> TodoModel:
     db.commit()
     db.refresh(new_todo)
     return new_todo
-
 
 def update(db: Session, todo_id: int, updated: TodoUpdate) -> TodoModel | None:
     todo = get_one(db, todo_id)
@@ -165,7 +449,6 @@ def update(db: Session, todo_id: int, updated: TodoUpdate) -> TodoModel | None:
     db.refresh(todo)
     return todo
 
-
 def delete(db: Session, todo_id: int) -> bool:
     todo = get_one(db, todo_id)
     if not todo:
@@ -175,140 +458,341 @@ def delete(db: Session, todo_id: int) -> bool:
     return True
 ```
 
-This layer contains all database logic, keeping routes clean:
-
-- **`get_all`** — fetches every row from `todos`
-- **`get_one`** — fetches a single row by `id`, returns `None` if not found
-- **`create`** — inserts a new row, refreshes to get the DB-generated `id`
-- **`update`** — applies only the fields that were sent (`exclude_none=True`)
-- **`delete`** — removes the row, returns `False` if it didn't exist
-
 ---
 
-### 6. `routers/todos.py` — HTTP Routes
+### 13. `routers/auth.py` — Auth Routes
 
 ```python
 from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy.orm import Session
 from database import get_db
+from schemas.user import UserCreate, UserResponse, Token
+from crud.user import get_by_email, create_user
+from core.security import verify_password, create_access_token
+from core.exceptions import AlreadyExistsException
+
+router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+@router.post("/register", response_model=UserResponse, status_code=201)
+def register(user: UserCreate, db: Session = Depends(get_db)):
+    if get_by_email(db, user.email):
+        raise AlreadyExistsException(detail="Email already registered")
+    return create_user(db, user)
+
+
+@router.post("/login", response_model=Token)
+def login(user: UserCreate, db: Session = Depends(get_db)):
+    db_user = get_by_email(db, user.email)
+    if not db_user or not verify_password(user.password, db_user.hashed_password):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    token = create_access_token(db_user.id)
+    return {"access_token": token, "token_type": "bearer"}
+```
+
+- **`/register`** — raises `AlreadyExistsException` if email is taken; caught globally → 400
+- **`/login`** — keeps `HTTPException(401)` since it's tied to the HTTP auth spec
+
+---
+
+### 14. `routers/todos.py` — Protected Todo Routes
+
+```python
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
+from database import get_db
 from schemas.todo import Todo, TodoCreate, TodoUpdate
+from core.security import get_current_user
+from core.exceptions import NotFoundException
 import crud.todo as crud
 
 router = APIRouter(prefix="/todos", tags=["todos"])
 
 
-@router.post("", response_model=Todo, status_code=201)
-def create_todo(todo: TodoCreate, db: Session = Depends(get_db)):
-    return crud.create(db, todo)
-
-
-@router.get("", response_model=list[Todo])
-def get_all_todos(db: Session = Depends(get_db)):
-    return crud.get_all(db)
-
-
 @router.get("/{todo_id}", response_model=Todo)
-def get_todo(todo_id: int, db: Session = Depends(get_db)):
+def get_todo(todo_id: int, db: Session = Depends(get_db), _=Depends(get_current_user)):
     todo = crud.get_one(db, todo_id)
     if not todo:
-        raise HTTPException(status_code=404, detail="Todo not found")
+        raise NotFoundException(resource="Todo", id=todo_id)
     return todo
 
-
-@router.put("/{todo_id}", response_model=Todo)
-def update_todo(todo_id: int, updated: TodoUpdate, db: Session = Depends(get_db)):
-    todo = crud.update(db, todo_id, updated)
-    if not todo:
-        raise HTTPException(status_code=404, detail="Todo not found")
-    return todo
-
-
-@router.delete("/{todo_id}", status_code=204)
-def delete_todo(todo_id: int, db: Session = Depends(get_db)):
-    if not crud.delete(db, todo_id):
-        raise HTTPException(status_code=404, detail="Todo not found")
+# ... same pattern for update and delete
 ```
 
-Routes are responsible only for HTTP concerns — accepting requests, calling the right crud function, and returning HTTP errors when something isn't found. No DB logic lives here.
-
-- **`APIRouter`** with `prefix="/todos"` means all routes automatically start with `/todos`
-- **`Depends(get_db)`** injects a DB session into each route automatically
+- All routes protected with `Depends(get_current_user)` → `401` if token is missing or invalid
+- Missing records raise `NotFoundException` → caught globally → `404` with descriptive message
 
 ---
 
-### 7. `main.py` — App Entry Point
+### 15. `main.py` — App Entry Point
 
 ```python
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
 from database import engine
 from models.todo import TodoModel
-from routers import todos
+from models.user import UserModel
+from routers import todos, auth
+from core.middleware import logging_middleware
+from core.exceptions import (
+    NotFoundException, not_found_handler,
+    AlreadyExistsException, already_exists_handler,
+    validation_handler, global_handler,
+)
 
 TodoModel.metadata.create_all(bind=engine)
+UserModel.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Todo API", version="1.0.0")
 
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.middleware("http")(logging_middleware)
+
+app.add_exception_handler(NotFoundException, not_found_handler)
+app.add_exception_handler(AlreadyExistsException, already_exists_handler)
+app.add_exception_handler(RequestValidationError, validation_handler)
+app.add_exception_handler(Exception, global_handler)
+
+app.include_router(auth.router)
 app.include_router(todos.router)
 ```
 
-- `metadata.create_all(bind=engine)` — creates the `todos` table on startup if it doesn't exist
-- `app.include_router(todos.router)` — registers all routes from `routers/todos.py`
+- **CORS middleware** — allows frontend apps on any origin to call the API
+- **Logging middleware** — logs every request with method, path, status, and duration
+- **Exception handlers** — every error type has a consistent JSON response shape
 
 ---
 
 ## Setup & Running
 
-### Prerequisites
-- Python 3.12+
-- PostgreSQL running locally
-- Poetry installed
+### Option A: Docker (Recommended)
 
-### Install dependencies
+Runs the API and PostgreSQL together — no local Python or Postgres installation needed.
+
+**Prerequisites:** Docker Desktop installed and running.
+
+```bash
+docker compose up --build
+```
+
+That's it. Docker will:
+1. Pull the PostgreSQL 16 image
+2. Build the API image from the `Dockerfile`
+3. Wait for Postgres to be healthy before starting the API
+4. Expose the API at `http://localhost:8000`
+
+**Other useful commands:**
+```bash
+docker compose up --build -d    # run in background
+docker compose logs -f api      # stream API logs
+docker compose down             # stop containers
+docker compose down -v          # stop + delete the database volume
+```
+
+**Docker files:**
+
+`Dockerfile` — builds the API image:
+```dockerfile
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY pyproject.toml .
+
+RUN pip install poetry && \
+    poetry config virtualenvs.create false && \
+    poetry install --no-root --no-interaction
+
+COPY . .
+
+EXPOSE 8000
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+`docker-compose.yml` — orchestrates both services:
+```yaml
+services:
+  db:
+    image: postgres:16-alpine
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build: .
+    restart: always
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/postgres
+      SECRET_KEY: change-this-to-a-long-random-secret-key-in-production
+      ALGORITHM: HS256
+      ACCESS_TOKEN_EXPIRE_MINUTES: 30
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+```
+
+> Note: `DATABASE_URL` uses `db` (the service name) instead of `localhost` so the API container can reach the database container.
+
+---
+
+### Option B: Local (without Docker)
+
+**Prerequisites:** Python 3.12+, PostgreSQL running locally, Poetry installed.
+
+**Install dependencies:**
 ```bash
 poetry install
 ```
 
-### Configure environment
-Edit `.env` with your Postgres credentials:
+**Configure environment** — edit `.env`:
 ```env
 DATABASE_URL=postgresql://<user>:<password>@localhost:5432/<dbname>
+SECRET_KEY=change-this-to-a-long-random-secret-key-in-production
+ALGORITHM=HS256
+ACCESS_TOKEN_EXPIRE_MINUTES=30
 ```
 
-### Start the server
+**Start the server:**
 ```bash
 poetry run uvicorn main:app --reload
-```
-
-### Open the interactive docs
-```
-http://127.0.0.1:8000/docs
 ```
 
 ---
 
 ## API Reference
 
-| Method | Endpoint | Description |
-|---|---|---|
-| `POST` | `/todos` | Create a new todo |
-| `GET` | `/todos` | Get all todos |
-| `GET` | `/todos/{id}` | Get a single todo |
-| `PUT` | `/todos/{id}` | Update a todo |
-| `DELETE` | `/todos/{id}` | Delete a todo |
+| Method | Endpoint | Auth Required | Description |
+|---|---|---|---|
+| `POST` | `/auth/register` | No | Register a new user |
+| `POST` | `/auth/login` | No | Login and receive a JWT token |
+| `GET` | `/todos` | Yes | Get all todos |
+| `POST` | `/todos` | Yes | Create a new todo |
+| `GET` | `/todos/{id}` | Yes | Get a single todo |
+| `PUT` | `/todos/{id}` | Yes | Update a todo |
+| `DELETE` | `/todos/{id}` | Yes | Delete a todo |
 
-### Example Request — Create Todo
+---
+
+## How to Test
+
+### Option 1: Swagger UI (Recommended)
+
+1. Open `http://127.0.0.1:8000/docs`
+2. Call `POST /auth/register` to create a user
+3. Call `POST /auth/login` — copy the `access_token` from the response
+4. Click the **Authorize** button (top right), paste the token, click **Authorize**
+5. All `/todos` routes are now unlocked — test them directly in the UI
+
+---
+
+### Option 2: curl (Terminal)
+
+**Step 1 — Register**
 ```bash
-curl -X POST http://127.0.0.1:8000/todos \
+curl -X POST http://127.0.0.1:8000/auth/register \
   -H "Content-Type: application/json" \
-  -d '{"title": "Buy milk", "description": "From the store", "completed": false}'
+  -d '{"email": "user@example.com", "password": "secret123"}'
+```
+```json
+{ "id": 1, "email": "user@example.com" }
 ```
 
-### Example Response
+**Step 2 — Login**
+```bash
+curl -X POST http://127.0.0.1:8000/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email": "user@example.com", "password": "secret123"}'
+```
 ```json
-{
-  "id": 1,
-  "title": "Buy milk",
-  "description": "From the store",
-  "completed": false
-}
+{ "access_token": "eyJhbGci...", "token_type": "bearer" }
+```
+
+**Step 3 — Use the token for all /todos routes**
+```bash
+# Get all todos
+curl http://127.0.0.1:8000/todos \
+  -H "Authorization: Bearer eyJhbGci..."
+
+# Create a todo
+curl -X POST http://127.0.0.1:8000/todos \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer eyJhbGci..." \
+  -d '{"title": "Buy milk", "description": "From the store"}'
+
+# Update a todo
+curl -X PUT http://127.0.0.1:8000/todos/1 \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer eyJhbGci..." \
+  -d '{"completed": true}'
+
+# Delete a todo
+curl -X DELETE http://127.0.0.1:8000/todos/1 \
+  -H "Authorization: Bearer eyJhbGci..."
+```
+
+**Test error responses:**
+
+```bash
+# Duplicate register → 400
+curl -X POST http://127.0.0.1:8000/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"email": "user@example.com", "password": "secret123"}'
+```
+```json
+{ "detail": "Email already registered" }
+```
+
+```bash
+# Todo not found → 404
+curl http://127.0.0.1:8000/todos/999 \
+  -H "Authorization: Bearer eyJhbGci..."
+```
+```json
+{ "detail": "Todo with id 999 not found" }
+```
+
+```bash
+# Missing required field → 422
+curl -X POST http://127.0.0.1:8000/todos \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer eyJhbGci..." \
+  -d '{"description": "No title provided"}'
+```
+```json
+{ "detail": [{ "field": "title", "message": "Field required" }] }
+```
+
+```bash
+# No token → 401
+curl http://127.0.0.1:8000/todos
+```
+```json
+{ "detail": "Not authenticated" }
+```
+
+```bash
+# Invalid token → 401
+curl http://127.0.0.1:8000/todos \
+  -H "Authorization: Bearer invalidtoken"
+```
+```json
+{ "detail": "Invalid or expired token" }
 ```
