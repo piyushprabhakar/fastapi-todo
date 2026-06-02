@@ -1,6 +1,20 @@
-# Todo API — FastAPI + PostgreSQL + JWT Auth
+# fastapi-todo
 
-A REST API for managing todos with JWT-based authentication, middleware, and centralized error handling, built with **FastAPI**, **SQLAlchemy**, and **PostgreSQL**.
+A REST API for managing todos with JWT authentication, request logging middleware, centralized error handling, and Docker support — built with **FastAPI**, **SQLAlchemy**, and **PostgreSQL**.
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|---|---|
+| Framework | FastAPI |
+| Database | PostgreSQL |
+| ORM | SQLAlchemy |
+| Auth | JWT (python-jose) + bcrypt |
+| Validation | Pydantic v2 |
+| Package manager | Poetry |
+| Container | Docker + Docker Compose |
 
 ---
 
@@ -10,7 +24,7 @@ A REST API for managing todos with JWT-based authentication, middleware, and cen
 fastapi-todo/
 ├── main.py                    # App entry point — registers routers, middleware, exception handlers
 ├── database.py                # DB engine, session factory, and Base
-├── .env                       # Environment variables
+├── .env                       # Environment variables (not committed — create manually)
 ├── pyproject.toml             # Poetry dependencies
 ├── Dockerfile                 # Container image definition
 ├── docker-compose.yml         # Orchestrates API + PostgreSQL containers
@@ -33,6 +47,101 @@ fastapi-todo/
     ├── user.py                # get_by_email(), create_user()
     └── todo.py                # Todo DB operations
 ```
+
+---
+
+## Quick Start
+
+### Option A: Docker (Recommended — no local Python or Postgres needed)
+
+```bash
+git clone https://github.com/<your-username>/fastapi-todo.git
+cd fastapi-todo
+docker compose up --build
+```
+
+API is available at `http://localhost:8000`
+Swagger docs at `http://localhost:8000/docs`
+
+---
+
+### Option B: Run Locally
+
+**1. Clone the repo**
+```bash
+git clone https://github.com/<your-username>/fastapi-todo.git
+cd fastapi-todo
+```
+
+**2. Install dependencies**
+```bash
+poetry install
+```
+
+**3. Create `.env`**
+
+`.env` is not committed to git. Create it manually in the project root:
+```bash
+touch .env
+```
+
+Add the following content:
+```env
+DATABASE_URL=postgresql://<user>:<password>@localhost:5432/<dbname>
+SECRET_KEY=change-this-to-a-long-random-secret-key-in-production
+ALGORITHM=HS256
+ACCESS_TOKEN_EXPIRE_MINUTES=30
+```
+
+Replace `<user>`, `<password>`, and `<dbname>` with your local PostgreSQL credentials.
+
+**4. Make sure PostgreSQL is running locally**
+
+On Mac with Homebrew:
+```bash
+brew services start postgresql
+```
+
+Create the database if it doesn't exist:
+```bash
+psql -U postgres -c "CREATE DATABASE <dbname>;"
+```
+
+**5. Start the server**
+```bash
+poetry run uvicorn main:app --reload
+```
+
+API is available at `http://localhost:8000`
+Swagger docs at `http://localhost:8000/docs`
+
+---
+
+## Docker Commands
+
+```bash
+docker compose up --build        # build and start (foreground)
+docker compose up --build -d     # build and start (background)
+docker compose logs -f api       # stream API logs
+docker compose logs -f db        # stream DB logs
+docker compose down              # stop containers (data preserved)
+docker compose down -v           # stop containers + delete database volume
+docker compose up --build api    # rebuild only the API after code changes
+```
+
+---
+
+## API Reference
+
+| Method | Endpoint | Auth Required | Description |
+|---|---|---|---|
+| `POST` | `/auth/register` | No | Register a new user |
+| `POST` | `/auth/login` | No | Login and receive a JWT token |
+| `GET` | `/todos` | Yes | Get all todos |
+| `POST` | `/todos` | Yes | Create a new todo |
+| `GET` | `/todos/{id}` | Yes | Get a single todo |
+| `PUT` | `/todos/{id}` | Yes | Update a todo (partial) |
+| `DELETE` | `/todos/{id}` | Yes | Delete a todo |
 
 ---
 
@@ -181,16 +290,13 @@ async def logging_middleware(request: Request, call_next):
     return response
 ```
 
-Wraps every request. Logs the HTTP method, path, response status code, and duration in milliseconds to stdout on every request:
+Logs every request to stdout:
 
 ```
 POST /auth/login → 200 (43.2ms)
 GET /todos → 200 (12.1ms)
 GET /todos/999 → 404 (8.7ms)
 ```
-
-- Everything **before** `call_next` runs on the way in
-- Everything **after** `call_next` runs on the way out with access to the response
 
 ---
 
@@ -222,68 +328,25 @@ async def not_found_handler(request: Request, exc: NotFoundException) -> JSONRes
 
 
 async def already_exists_handler(request: Request, exc: AlreadyExistsException) -> JSONResponse:
-    return JSONResponse(
-        status_code=400,
-        content={"detail": exc.detail},
-    )
+    return JSONResponse(status_code=400, content={"detail": exc.detail})
 
 
 async def validation_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
-    errors = [
-        {"field": e["loc"][-1], "message": e["msg"]}
-        for e in exc.errors()
-    ]
+    errors = [{"field": e["loc"][-1], "message": e["msg"]} for e in exc.errors()]
     return JSONResponse(status_code=422, content={"detail": errors})
 
 
 async def global_handler(request: Request, exc: Exception) -> JSONResponse:
     print(f"Unhandled error: {type(exc).__name__}: {exc}", file=sys.stderr)
-    return JSONResponse(
-        status_code=500,
-        content={"detail": "An unexpected error occurred"},
-    )
+    return JSONResponse(status_code=500, content={"detail": "An unexpected error occurred"})
 ```
 
-**Custom exception classes:**
-
-| Class | Raised when | HTTP Status |
-|---|---|---|
-| `NotFoundException` | A todo ID doesn't exist in the DB | 404 |
-| `AlreadyExistsException` | Registering with a duplicate email | 400 |
-
-**Global exception handlers** — registered in `main.py`, catch specific exception types across the entire app:
-
-| Handler | Catches | Response |
-|---|---|---|
-| `not_found_handler` | `NotFoundException` | `{"detail": "Todo with id 5 not found"}` |
-| `already_exists_handler` | `AlreadyExistsException` | `{"detail": "Email already registered"}` |
-| `validation_handler` | `RequestValidationError` (422) | Clean field-level errors list |
-| `global_handler` | Any unhandled `Exception` | Safe 500 message; logs real error to stderr |
-
-**Before (inline HTTPException):**
-```python
-raise HTTPException(status_code=404, detail="Todo not found")
-```
-
-**After (semantic custom exception):**
-```python
-raise NotFoundException(resource="Todo", id=todo_id)
-# → {"detail": "Todo with id 5 not found"}
-```
-
-**Validation error — before (verbose default):**
-```json
-{
-  "detail": [{"type": "missing", "loc": ["body", "title"], "msg": "Field required", ...}]
-}
-```
-
-**Validation error — after (clean):**
-```json
-{
-  "detail": [{"field": "title", "message": "Field required"}]
-}
-```
+| Handler | Catches | Status | Response |
+|---|---|---|---|
+| `not_found_handler` | `NotFoundException` | 404 | `{"detail": "Todo with id 5 not found"}` |
+| `already_exists_handler` | `AlreadyExistsException` | 400 | `{"detail": "Email already registered"}` |
+| `validation_handler` | `RequestValidationError` | 422 | `{"detail": [{"field": "title", "message": "Field required"}]}` |
+| `global_handler` | Any unhandled `Exception` | 500 | `{"detail": "An unexpected error occurred"}` |
 
 ---
 
@@ -301,8 +364,6 @@ class UserModel(Base):
     email = Column(String, unique=True, nullable=False, index=True)
     hashed_password = Column(String, nullable=False)
 ```
-
-The `users` table stores only `email` and `hashed_password` — never the plain password.
 
 ---
 
@@ -516,7 +577,7 @@ def get_todo(todo_id: int, db: Session = Depends(get_db), _=Depends(get_current_
         raise NotFoundException(resource="Todo", id=todo_id)
     return todo
 
-# ... same pattern for update and delete
+# ... same pattern for create, update, and delete
 ```
 
 - All routes protected with `Depends(get_current_user)` → `401` if token is missing or invalid
@@ -564,138 +625,11 @@ app.include_router(todos.router)
 
 ---
 
-## Setup & Running
-
-### Option A: Docker (Recommended)
-
-Runs the API and PostgreSQL together — no local Python or Postgres installation needed.
-
-**Prerequisites:** Docker Desktop installed and running.
-
-```bash
-docker compose up --build
-```
-
-That's it. Docker will:
-1. Pull the PostgreSQL 16 image
-2. Build the API image from the `Dockerfile`
-3. Wait for Postgres to be healthy before starting the API
-4. Expose the API at `http://localhost:8000`
-
-**Other useful commands:**
-```bash
-docker compose up --build -d    # run in background
-docker compose logs -f api      # stream API logs
-docker compose down             # stop containers
-docker compose down -v          # stop + delete the database volume
-```
-
-**Docker files:**
-
-`Dockerfile` — builds the API image:
-```dockerfile
-FROM python:3.12-slim
-
-WORKDIR /app
-
-COPY pyproject.toml .
-
-RUN pip install poetry && \
-    poetry config virtualenvs.create false && \
-    poetry install --no-root --no-interaction
-
-COPY . .
-
-EXPOSE 8000
-
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
-```
-
-`docker-compose.yml` — orchestrates both services:
-```yaml
-services:
-  db:
-    image: postgres:16-alpine
-    restart: always
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: postgres
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
-  api:
-    build: .
-    restart: always
-    ports:
-      - "8000:8000"
-    environment:
-      DATABASE_URL: postgresql://postgres:postgres@db:5432/postgres
-      SECRET_KEY: change-this-to-a-long-random-secret-key-in-production
-      ALGORITHM: HS256
-      ACCESS_TOKEN_EXPIRE_MINUTES: 30
-    depends_on:
-      db:
-        condition: service_healthy
-
-volumes:
-  postgres_data:
-```
-
-> Note: `DATABASE_URL` uses `db` (the service name) instead of `localhost` so the API container can reach the database container.
-
----
-
-### Option B: Local (without Docker)
-
-**Prerequisites:** Python 3.12+, PostgreSQL running locally, Poetry installed.
-
-**Install dependencies:**
-```bash
-poetry install
-```
-
-**Configure environment** — edit `.env`:
-```env
-DATABASE_URL=postgresql://<user>:<password>@localhost:5432/<dbname>
-SECRET_KEY=change-this-to-a-long-random-secret-key-in-production
-ALGORITHM=HS256
-ACCESS_TOKEN_EXPIRE_MINUTES=30
-```
-
-**Start the server:**
-```bash
-poetry run uvicorn main:app --reload
-```
-
----
-
-## API Reference
-
-| Method | Endpoint | Auth Required | Description |
-|---|---|---|---|
-| `POST` | `/auth/register` | No | Register a new user |
-| `POST` | `/auth/login` | No | Login and receive a JWT token |
-| `GET` | `/todos` | Yes | Get all todos |
-| `POST` | `/todos` | Yes | Create a new todo |
-| `GET` | `/todos/{id}` | Yes | Get a single todo |
-| `PUT` | `/todos/{id}` | Yes | Update a todo |
-| `DELETE` | `/todos/{id}` | Yes | Delete a todo |
-
----
-
 ## How to Test
 
 ### Option 1: Swagger UI (Recommended)
 
-1. Open `http://127.0.0.1:8000/docs`
+1. Open `http://localhost:8000/docs`
 2. Call `POST /auth/register` to create a user
 3. Call `POST /auth/login` — copy the `access_token` from the response
 4. Click the **Authorize** button (top right), paste the token, click **Authorize**
@@ -705,9 +639,9 @@ poetry run uvicorn main:app --reload
 
 ### Option 2: curl (Terminal)
 
-**Step 1 — Register**
+**Register**
 ```bash
-curl -X POST http://127.0.0.1:8000/auth/register \
+curl -X POST http://localhost:8000/auth/register \
   -H "Content-Type: application/json" \
   -d '{"email": "user@example.com", "password": "secret123"}'
 ```
@@ -715,9 +649,9 @@ curl -X POST http://127.0.0.1:8000/auth/register \
 { "id": 1, "email": "user@example.com" }
 ```
 
-**Step 2 — Login**
+**Login**
 ```bash
-curl -X POST http://127.0.0.1:8000/auth/login \
+curl -X POST http://localhost:8000/auth/login \
   -H "Content-Type: application/json" \
   -d '{"email": "user@example.com", "password": "secret123"}'
 ```
@@ -725,74 +659,44 @@ curl -X POST http://127.0.0.1:8000/auth/login \
 { "access_token": "eyJhbGci...", "token_type": "bearer" }
 ```
 
-**Step 3 — Use the token for all /todos routes**
+**Create a todo**
 ```bash
-# Get all todos
-curl http://127.0.0.1:8000/todos \
-  -H "Authorization: Bearer eyJhbGci..."
-
-# Create a todo
-curl -X POST http://127.0.0.1:8000/todos \
+curl -X POST http://localhost:8000/todos \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer eyJhbGci..." \
   -d '{"title": "Buy milk", "description": "From the store"}'
+```
 
-# Update a todo
-curl -X PUT http://127.0.0.1:8000/todos/1 \
+**Get all todos**
+```bash
+curl http://localhost:8000/todos \
+  -H "Authorization: Bearer eyJhbGci..."
+```
+
+**Update a todo**
+```bash
+curl -X PUT http://localhost:8000/todos/1 \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer eyJhbGci..." \
   -d '{"completed": true}'
+```
 
-# Delete a todo
-curl -X DELETE http://127.0.0.1:8000/todos/1 \
+**Delete a todo**
+```bash
+curl -X DELETE http://localhost:8000/todos/1 \
   -H "Authorization: Bearer eyJhbGci..."
 ```
 
-**Test error responses:**
+---
 
-```bash
-# Duplicate register → 400
-curl -X POST http://127.0.0.1:8000/auth/register \
-  -H "Content-Type: application/json" \
-  -d '{"email": "user@example.com", "password": "secret123"}'
-```
-```json
-{ "detail": "Email already registered" }
-```
+### Error Response Reference
 
-```bash
-# Todo not found → 404
-curl http://127.0.0.1:8000/todos/999 \
-  -H "Authorization: Bearer eyJhbGci..."
-```
-```json
-{ "detail": "Todo with id 999 not found" }
-```
-
-```bash
-# Missing required field → 422
-curl -X POST http://127.0.0.1:8000/todos \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer eyJhbGci..." \
-  -d '{"description": "No title provided"}'
-```
-```json
-{ "detail": [{ "field": "title", "message": "Field required" }] }
-```
-
-```bash
-# No token → 401
-curl http://127.0.0.1:8000/todos
-```
-```json
-{ "detail": "Not authenticated" }
-```
-
-```bash
-# Invalid token → 401
-curl http://127.0.0.1:8000/todos \
-  -H "Authorization: Bearer invalidtoken"
-```
-```json
-{ "detail": "Invalid or expired token" }
-```
+| Scenario | Status | Response |
+|---|---|---|
+| Duplicate email | 400 | `{"detail": "Email already registered"}` |
+| Wrong password | 401 | `{"detail": "Invalid email or password"}` |
+| No token | 401 | `{"detail": "Not authenticated"}` |
+| Invalid token | 401 | `{"detail": "Invalid or expired token"}` |
+| Todo not found | 404 | `{"detail": "Todo with id 999 not found"}` |
+| Missing field | 422 | `{"detail": [{"field": "title", "message": "Field required"}]}` |
+| Server error | 500 | `{"detail": "An unexpected error occurred"}` |
